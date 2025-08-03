@@ -36,10 +36,20 @@ class SimpleSupplierPredictor:
             model_path = 'models/supplier_predictor_v2.pkl'
             
             if os.path.exists(model_path):
-                self.predictor.load_model(model_path)
-                self.predictor.load_data()
-                self.initialized = True
-                print("✓ ML预测模型已就绪")
+                try:
+                    self.predictor.load_model(model_path)
+                    self.predictor.load_data()
+                    self.initialized = True
+                    print("✓ ML预测模型已就绪（48周窗口，59特征）")
+                except Exception as load_error:
+                    print(f"模型加载失败: {load_error}")
+                    print("重新训练模型...")
+                    if self.predictor.train():
+                        self.predictor.save_model(model_path)
+                        self.initialized = True
+                        print("✓ ML模型重新训练完成")
+                    else:
+                        print("✗ ML模型重新训练失败，将使用简化方法")
             else:
                 print("正在训练ML模型...")
                 if self.predictor.train():

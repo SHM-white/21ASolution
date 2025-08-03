@@ -6,6 +6,9 @@
 import pandas as pd
 import numpy as np
 from supplier_prediction_model_v2 import predict_multiple_suppliers, get_trained_model
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
+import os
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -90,21 +93,23 @@ class MonteCarloSimulator:
         
         return supplier_df
     
-    def simulate_supply_scenario(self, selected_suppliers, num_simulations=500):
+    def simulate_supply_scenario(self, selected_suppliers, num_simulations=500, show_progress=True):
         """
         模拟供应场景
         
         参数:
         - selected_suppliers: 选定的供应商DataFrame
         - num_simulations: 模拟次数
+        - show_progress: 是否显示进度信息
         
         返回:
         - 模拟结果字典
         """
-        print(f"开始蒙特卡洛模拟...")
-        print(f"  选定供应商数量: {len(selected_suppliers)}")
-        print(f"  模拟次数: {num_simulations}")
-        print(f"  目标周产能: {self.target_weekly_capacity:,} 立方米")
+        if show_progress:
+            print(f"开始蒙特卡洛模拟...")
+            print(f"  选定供应商数量: {len(selected_suppliers)}")
+            print(f"  模拟次数: {num_simulations}")
+            print(f"  目标周产能: {self.target_weekly_capacity:,} 立方米")
         
         # 获取供应商ID列表
         supplier_ids = selected_suppliers['supplier_id'].tolist()
@@ -114,7 +119,7 @@ class MonteCarloSimulator:
         min_weekly_capacities = []
         
         for sim in range(num_simulations):
-            if (sim + 1) % 100 == 0:
+            if show_progress and (sim + 1) % 100 == 0:
                 print(f"  进度: {sim + 1}/{num_simulations}")
             
             try:
@@ -197,20 +202,66 @@ class MonteCarloSimulator:
             'weekly_capacities_all': weekly_capacities_all
         }
         
-        print(f"  模拟完成!")
-        print(f"  成功率: {success_rate:.2%}")
-        print(f"  平均最低周产能: {avg_min_capacity:,.0f}")
-        print(f"  95%置信区间: [{percentile_5:,.0f}, {percentile_95:,.0f}]")
+        if show_progress:
+            print(f"  模拟完成!")
+            print(f"  成功率: {success_rate:.2%}")
+            print(f"  平均最低周产能: {avg_min_capacity:,.0f}")
+            print(f"  95%置信区间: [{percentile_5:,.0f}, {percentile_95:,.0f}]")
         
         return result
     
-    def find_minimum_suppliers(self, max_suppliers=100, step_size=5):
+    def _test_supplier_count(self, num_suppliers, supplier_pool):
+        """
+        测试指定数量供应商的单个工作函数（用于多线程）
+        
+        参数:
+        - num_suppliers: 供应商数量
+        - supplier_pool: 供应商池DataFrame
+        
+        返回:
+        - 模拟结果字典
+        """
+        try:
+            # 选择Top N供应商
+            selected_suppliers = supplier_pool.head(num_suppliers)
+            
+            # 进行蒙特卡洛模拟
+            simulation_result = self.simulate_supply_scenario(
+                selected_suppliers, 
+                num_simulations=100, 
+                show_progress=False  # 多线程时不显示内部进度
+            )
+            
+            # 添加供应商组成信息
+            material_counts = selected_suppliers['material_type'].value_counts()
+            composition = {}
+            for material in ['A', 'B', 'C']:
+                count = material_counts.get(material, 0)
+                if count > 0:
+                    total_capacity = selected_suppliers[
+                        selected_suppliers['material_type'] == material
+                    ]['avg_weekly_capacity'].sum()
+                    composition[material] = {
+                        'count': count,
+                        'total_capacity': total_capacity
+                    }
+            
+            simulation_result['composition'] = composition
+            return simulation_result
+            
+        except Exception as e:
+            print(f"  ✗ 测试 {num_suppliers} 家供应商时出错: {e}")
+            return None
+
+    def find_minimum_suppliers(self, max_suppliers=402, step_size=5, use_multithread=True, start_count=200, max_workers=None):
         """
         寻找满足需求的最少供应商数量
         
         参数:
         - max_suppliers: 最大测试供应商数量
         - step_size: 步长
+        - use_multithread: 是否使用多线程
+        - max_workers: 最大工作线程数
         
         返回:
         - 结果字典
@@ -222,9 +273,6 @@ class MonteCarloSimulator:
         # 加载供应商数据
         supplier_pool = self.load_supplier_data()
         
-        results = []
-        recommended_count = None
-        
         # 确保训练好了ML模型
         print("确保ML模型已训练...")
         try:
@@ -234,41 +282,98 @@ class MonteCarloSimulator:
             print(f"✗ ML模型初始化失败: {e}")
             return None
         
-        # 测试不同数量的供应商组合
-        for num_suppliers in range(step_size, min(max_suppliers + 1, len(supplier_pool) + 1), step_size):
-            print(f"\n--- 测试 {num_suppliers} 家供应商 ---")
+        # 生成要测试的供应商数量列表
+        test_counts = list(range(start_count, min(max_suppliers + 1, len(supplier_pool) + 1), step_size))
+        print(f"将测试 {len(test_counts)} 种不同的供应商数量组合: {test_counts}")
+        
+        results = []
+        recommended_count = None
+        
+        if use_multithread and len(test_counts) > 1:
+            # 多线程并行测试
+            if max_workers is None:
+                max_workers = min(20, (os.cpu_count() or 1))  # 限制最大线程数，避免过度消耗资源
             
-            # 选择Top N供应商
-            selected_suppliers = supplier_pool.head(num_suppliers)
+            print(f"🚀 使用多线程模式，最大线程数: {max_workers}")
+            print("=" * 60)
             
-            # 显示选择的供应商组合
-            material_counts = selected_suppliers['material_type'].value_counts()
-            print(f"选择的供应商构成:")
-            for material in ['A', 'B', 'C']:
-                count = material_counts.get(material, 0)
-                if count > 0:
-                    avg_capacity = selected_suppliers[selected_suppliers['material_type'] == material]['avg_weekly_capacity'].sum()
-                    print(f"  {material}类: {count}家, 总产能: {avg_capacity:,.0f}")
-            
-            # 进行蒙特卡洛模拟
-            simulation_result = self.simulate_supply_scenario(selected_suppliers, num_simulations=300)
-            
-            results.append(simulation_result)
-            
-            # 判断是否达到成功率要求
-            if simulation_result['success_rate'] >= self.success_threshold and recommended_count is None:
-                recommended_count = num_suppliers
-                print(f"★ 找到推荐方案！")
-                print(f"  推荐供应商数量: {num_suppliers} 家")
-                print(f"  成功率: {simulation_result['success_rate']:.2%}")
-                print(f"  平均最低周产能: {simulation_result['avg_min_capacity']:,.0f}")
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # 提交所有任务
+                future_to_count = {
+                    executor.submit(self._test_supplier_count, num_suppliers, supplier_pool): num_suppliers 
+                    for num_suppliers in test_counts
+                }
                 
-                # 继续测试几个更大的组合以验证稳定性
-                if num_suppliers < max_suppliers - 2 * step_size:
-                    print(f"  继续验证更大规模组合的稳定性...")
-                    continue
-                else:
-                    break
+                # 使用tqdm显示总体进度
+                with tqdm(total=len(test_counts), desc="测试不同供应商数量", unit="组合") as pbar:
+                    for future in as_completed(future_to_count):
+                        num_suppliers = future_to_count[future]
+                        
+                        try:
+                            simulation_result = future.result()
+                            
+                            if simulation_result is not None:
+                                results.append(simulation_result)
+                                
+                                # 更新进度条描述
+                                success_rate = simulation_result['success_rate']
+                                pbar.set_postfix({
+                                    f'{num_suppliers}家': f'{success_rate:.1%}',
+                                    '目标': f'{self.success_threshold:.0%}'
+                                })
+                                
+                                # 检查是否达到成功率要求
+                                if success_rate >= self.success_threshold and recommended_count is None:
+                                    recommended_count = num_suppliers
+                                    print(f"\n★ 找到推荐方案！{num_suppliers} 家供应商，成功率: {success_rate:.2%}")
+                            
+                        except Exception as e:
+                            print(f"\n✗ 测试 {num_suppliers} 家供应商时出错: {e}")
+                        
+                        pbar.update(1)
+            
+            # 按供应商数量排序结果
+            results.sort(key=lambda x: x['num_suppliers'])
+            
+        else:
+            # 单线程顺序测试（原有逻辑）
+            print("🔄 使用单线程模式")
+            print("=" * 60)
+            
+            for num_suppliers in test_counts:
+                print(f"\n--- 测试 {num_suppliers} 家供应商 ---")
+                
+                # 选择Top N供应商
+                selected_suppliers = supplier_pool.head(num_suppliers)
+                
+                # 显示选择的供应商组合
+                material_counts = selected_suppliers['material_type'].value_counts()
+                print(f"选择的供应商构成:")
+                for material in ['A', 'B', 'C']:
+                    count = material_counts.get(material, 0)
+                    if count > 0:
+                        avg_capacity = selected_suppliers[selected_suppliers['material_type'] == material]['avg_weekly_capacity'].sum()
+                        print(f"  {material}类: {count}家, 总产能: {avg_capacity:,.0f}")
+                
+                # 进行蒙特卡洛模拟
+                simulation_result = self.simulate_supply_scenario(selected_suppliers, num_simulations=100)
+                
+                results.append(simulation_result)
+                
+                # 判断是否达到成功率要求
+                if simulation_result['success_rate'] >= self.success_threshold and recommended_count is None:
+                    recommended_count = num_suppliers
+                    print(f"★ 找到推荐方案！")
+                    print(f"  推荐供应商数量: {num_suppliers} 家")
+                    print(f"  成功率: {simulation_result['success_rate']:.2%}")
+                    print(f"  平均最低周产能: {simulation_result['avg_min_capacity']:,.0f}")
+                    
+                    # 继续测试几个更大的组合以验证稳定性
+                    if num_suppliers < max_suppliers - 2 * step_size:
+                        print(f"  继续验证更大规模组合的稳定性...")
+                        continue
+                    else:
+                        break
         
         # 汇总结果
         final_result = {
@@ -301,6 +406,22 @@ class MonteCarloSimulator:
                 print(f"  目标周产能: {self.target_weekly_capacity:,} 立方米")
                 print(f"  安全边际: {self.safety_margin:.1%}")
                 print(f"  95%置信区间: [{recommended_result['confidence_interval_5_95'][0]:,.0f}, {recommended_result['confidence_interval_5_95'][1]:,.0f}]")
+                
+                # 显示供应商组成（如果有的话）
+                if 'composition' in recommended_result:
+                    print(f"  供应商组成:")
+                    for material, info in recommended_result['composition'].items():
+                        print(f"    {material}类: {info['count']}家, 总产能: {info['total_capacity']:,.0f}")
+                else:
+                    # 多线程模式可能没有composition信息，手动计算
+                    selected_suppliers = supplier_pool.head(recommended_count)
+                    material_counts = selected_suppliers['material_type'].value_counts()
+                    print(f"  供应商组成:")
+                    for material in ['A', 'B', 'C']:
+                        count = material_counts.get(material, 0)
+                        if count > 0:
+                            total_capacity = selected_suppliers[selected_suppliers['material_type'] == material]['avg_weekly_capacity'].sum()
+                            print(f"    {material}类: {count}家, 总产能: {total_capacity:,.0f}")
         else:
             print(f"✗ 在测试范围内未找到满足 {self.success_threshold:.0%} 成功率的方案")
             print(f"建议:")
@@ -335,7 +456,13 @@ def main():
     
     # 执行分析
     try:
-        result = simulator.find_minimum_suppliers(max_suppliers=402, step_size=10)
+        result = simulator.find_minimum_suppliers(
+            max_suppliers=402, 
+            step_size=10, 
+            use_multithread=True,
+            start_count=300,
+            max_workers=20  # 限制线程数，避免过度消耗资源
+        )
         
         if result:
             print(f"\n分析成功完成!")

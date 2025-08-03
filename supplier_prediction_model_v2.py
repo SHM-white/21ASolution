@@ -1,420 +1,430 @@
 """
-供应商供货量预测模型 V2.0
-直接基于历史数据的简化预测模型
-
-主要功能：
-1. 直接从数据表读取供应商历史供货数据
-2. 基于时间序列特征进行预测
-3. 简化接口：只需供应商ID和预测周数
-4. 针对不同供应商的供货特征进行个性化预测
+供应商供货量预测模型 - Version 2.0
+基于统计特征的机器学习预测模型
 """
 
 import pandas as pd
 import numpy as np
-import warnings
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-import joblib
-import os
-
+from sklearn.metrics import mean_squared_error, r2_score
+import warnings
 warnings.filterwarnings('ignore')
 
-class SupplierPredictorV2:
-    """供应商供货量预测器 V2.0"""
+
+class SupplierPredictionModel:
+    """供应商供货量预测模型"""
     
     def __init__(self):
         self.model = None
         self.scaler = StandardScaler()
-        self.supplier_data = None
-        self.week_columns = []
+        self.features = None
         self.is_trained = False
+        self.supplier_stats = {}
         
     def load_data(self):
-        """加载供应商历史供货数据"""
-        print("正在加载供应商历史供货数据...")
+        """加载训练数据"""
+        print("加载数据文件...")
         
-        try:
-            # 读取供应商周供货数据（实际供货量）
-            supply_file = "C/附件1 近5年402家供应商的相关数据.xlsx"
-            if os.path.exists(supply_file):
-                self.supplier_data = pd.read_excel(supply_file)
-                print(f"✓ 成功加载供应商数据: {len(self.supplier_data)} 家供应商")
-            else:
-                # 备用数据源
-                supply_file = "DataFrames/原材料转换为产品制造能力.xlsx"
-                self.supplier_data = pd.read_excel(supply_file)
-                print(f"✓ 成功加载备用供应商数据: {len(self.supplier_data)} 家供应商")
-            
-            # 获取周数据列
-            self.week_columns = [col for col in self.supplier_data.columns if col.startswith('W')]
-            print(f"✓ 发现 {len(self.week_columns)} 周的历史数据")
-            
-            return True
-            
-        except Exception as e:
-            print(f"✗ 数据加载失败: {e}")
-            return False
+        # 1. 加载供应商统计特征数据
+        stat_df = pd.read_excel('DataFrames/供应商统计数据离散系数.xlsx', header=None)
+        # 第3行(索引2)是列名，第4行(索引3)开始是数据
+        headers = stat_df.iloc[2].tolist()
+        stats_data = stat_df.iloc[3:].copy()
+        stats_data.columns = headers
+        stats_data = stats_data.reset_index(drop=True)
+        
+        # 清理数据类型
+        numeric_columns = ['计数', '最小值', '最大值', '平均值', '平均值误差', '标准差', '方差', 
+                          '偏度', '峰度', '25%分位数', '50%分位数', '75%分位数', '85%分位数', '90%分位数', '变异系数']
+        
+        for col in numeric_columns:
+            stats_data[col] = pd.to_numeric(stats_data[col], errors='coerce')
+        
+        print(f"统计特征数据: {stats_data.shape}")
+        
+        # 2. 加载原始供货数据
+        supply_df = pd.read_excel('C/附件1 近5年402家供应商的相关数据.xlsx', 
+                                 sheet_name='供应商的供货量（m³）')
+        print(f"原始供货数据: {supply_df.shape}")
+        
+        return stats_data, supply_df
     
-    def get_supplier_history(self, supplier_id):
-        """获取指定供应商的历史供货数据"""
-        supplier_row = self.supplier_data[self.supplier_data['供应商ID'] == supplier_id]
+    def prepare_training_data(self, stats_data, supply_df):
+        """准备训练数据"""
+        print("准备训练数据...")
         
-        if supplier_row.empty:
-            print(f"警告: 未找到供应商 {supplier_id}")
-            return None, None
+        # 获取周数据列
+        week_columns = [col for col in supply_df.columns if col.startswith('W')]
+        print(f"发现 {len(week_columns)} 个周数据列")
         
-        supplier_row = supplier_row.iloc[0]
-        material_type = supplier_row['材料分类']
+        training_samples = []
         
-        # 获取历史供货数据
-        history = []
-        for col in self.week_columns:
-            value = supplier_row[col]
-            if pd.notna(value):
-                history.append(float(value))
-            else:
-                history.append(0.0)
-        
-        return np.array(history), material_type
-    
-    def create_training_data(self):
-        """创建训练数据"""
-        print("正在创建训练数据...")
-        
-        features = []
-        targets = []
-        
-        for _, supplier_row in self.supplier_data.iterrows():
+        for _, supplier_row in supply_df.iterrows():
             supplier_id = supplier_row['供应商ID']
             material_type = supplier_row['材料分类']
             
-            # 获取该供应商的历史数据
-            history = []
-            for col in self.week_columns:
-                value = supplier_row[col]
-                if pd.notna(value):
-                    history.append(float(value))
-                else:
-                    history.append(0.0)
-            
-            history = np.array(history)
-            
-            # 创建滑动窗口数据
-            window_size = 48  # 使用48周历史数据预测下一周
-            
-            for i in range(window_size, len(history) - 1):
-                # 输入特征：前48周的数据
-                input_window = history[i-window_size:i]
-                # 目标：下一周的供货量
-                target = history[i]
+            # 获取该供应商的统计特征
+            supplier_stats = stats_data[stats_data['供应商统计数据'] == supplier_id]
+            if supplier_stats.empty:
+                continue
                 
-                # 只有当目标值和历史数据都有效时才添加
-                if target >= 0 and np.sum(input_window >= 0) >= window_size * 0.7:  # 至少70%的数据有效
-                    
-                    # 基础特征
-                    feature_vector = list(input_window)  # 直接使用原始历史数据
-                    
-                    # 统计特征
-                    valid_history = input_window[input_window >= 0]
-                    if len(valid_history) > 0:
-                        feature_vector.extend([
-                            np.mean(valid_history),      # 均值
-                            np.std(valid_history),       # 标准差
-                            np.max(valid_history),       # 最大值
-                            np.min(valid_history),       # 最小值
-                            np.median(valid_history),    # 中位数
-                        ])
-                    else:
-                        feature_vector.extend([0, 0, 0, 0, 0])
-                    
-                    # 趋势特征
-                    if len(valid_history) >= 2:
-                        trend = valid_history[-1] - valid_history[0]  # 趋势
-                        volatility = np.std(valid_history) / (np.mean(valid_history) + 1e-8)  # 波动率
-                        feature_vector.extend([trend, volatility])
-                    else:
-                        feature_vector.extend([0, 0])
-                    
-                    # 时间特征
-                    feature_vector.extend([
-                        i % 52,           # 年内周数
-                        (i // 4) % 12,   # 月份
-                        i,                # 绝对周数
-                    ])
-                    
-                    # 材料类型编码
-                    material_encode = {'A': 1, 'B': 2, 'C': 3}.get(material_type, 0)
-                    feature_vector.append(material_encode)
-                    
-                    features.append(feature_vector)
-                    targets.append(target)
+            stats_row = supplier_stats.iloc[0]
+            
+            # 提取统计特征作为模型输入
+            features = {
+                'material_type_A': 1 if material_type == 'A' else 0,
+                'material_type_B': 1 if material_type == 'B' else 0,
+                'material_type_C': 1 if material_type == 'C' else 0,
+                'count': stats_row['计数'],
+                'mean': stats_row['平均值'],
+                'std': stats_row['标准差'],
+                'variance': stats_row['方差'],
+                'skewness': stats_row['偏度'] if pd.notna(stats_row['偏度']) else 0,
+                'kurtosis': stats_row['峰度'] if pd.notna(stats_row['峰度']) else 0,
+                'min_val': stats_row['最小值'],
+                'max_val': stats_row['最大值'],
+                'q25': stats_row['25%分位数'],
+                'q50': stats_row['50%分位数'],
+                'q75': stats_row['75%分位数'],
+                'q85': stats_row['85%分位数'],
+                'q90': stats_row['90%分位数'],
+                'cv': stats_row['变异系数']
+            }
+            
+            # 为每个周创建训练样本（使用滑动窗口）
+            week_values = supplier_row[week_columns].values
+            
+            # 使用滑动窗口：前N周预测后1周
+            window_size = 8  # 使用8周历史数据预测下一周
+            
+            for i in range(window_size, len(week_values)):
+                # 历史窗口特征
+                window_data = week_values[i-window_size:i]
+                
+                sample_features = features.copy()
+                sample_features.update({
+                    f'lag_{j+1}': window_data[-(j+1)] for j in range(min(4, window_size))  # 最近4周
+                })
+                sample_features.update({
+                    'window_mean': np.mean(window_data),
+                    'window_std': np.std(window_data),
+                    'window_trend': (window_data[-1] - window_data[0]) / window_size,
+                    'week_in_year': i % 52  # 季节性特征
+                })
+                
+                # 目标值
+                target = week_values[i]
+                
+                training_samples.append({
+                    'supplier_id': supplier_id,
+                    'week_index': i,
+                    'features': sample_features,
+                    'target': target
+                })
         
-        X = np.array(features)
-        y = np.array(targets)
+        print(f"生成 {len(training_samples)} 个训练样本")
         
-        print(f"✓ 创建训练数据完成: {len(X)} 个样本, {X.shape[1]} 个特征")
-        print(f"  目标值统计: 均值={np.mean(y):.2f}, 中位数={np.median(y):.2f}, 最大值={np.max(y):.2f}")
+        # 转换为DataFrame
+        features_list = []
+        targets = []
         
-        return X, y
+        for sample in training_samples:
+            features_list.append(sample['features'])
+            targets.append(sample['target'])
+        
+        features_df = pd.DataFrame(features_list)
+        targets = np.array(targets)
+        
+        # 填充缺失值
+        features_df = features_df.fillna(0)
+        
+        print(f"特征矩阵形状: {features_df.shape}")
+        print(f"目标向量长度: {len(targets)}")
+        
+        return features_df, targets, training_samples
     
-    def train(self):
-        """训练模型"""
-        print("=" * 60)
-        print("开始训练供应商供货量预测模型 V2.0")
-        print("=" * 60)
+    def train_model(self):
+        """训练预测模型"""
+        print("开始训练模型...")
         
         # 加载数据
-        if not self.load_data():
-            return False
+        stats_data, supply_df = self.load_data()
         
-        # 创建训练数据
-        X, y = self.create_training_data()
+        # 准备训练数据
+        X, y, training_samples = self.prepare_training_data(stats_data, supply_df)
         
-        if len(X) == 0:
-            print("✗ 无有效训练数据")
-            return False
+        # 保存特征列名
+        self.features = X.columns.tolist()
         
-        print("正在训练模型...")
-        
-        # 标准化特征
+        # 数据标准化
         X_scaled = self.scaler.fit_transform(X)
         
-        # 训练随机森林模型
-        self.model = RandomForestRegressor(
-            n_estimators=200,
+        # 划分训练测试集
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_scaled, y, test_size=0.2, random_state=42
+        )
+        
+        # 训练集成模型
+        print("训练随机森林模型...")
+        rf_model = RandomForestRegressor(
+            n_estimators=100,
             max_depth=15,
-            min_samples_split=10,
-            min_samples_leaf=5,
+            min_samples_split=5,
+            min_samples_leaf=2,
             random_state=42,
             n_jobs=-1
         )
+        rf_model.fit(X_train, y_train)
         
-        self.model.fit(X_scaled, y)
+        print("训练梯度提升模型...")
+        gb_model = GradientBoostingRegressor(
+            n_estimators=100,
+            max_depth=8,
+            learning_rate=0.1,
+            random_state=42
+        )
+        gb_model.fit(X_train, y_train)
         
-        # 模型评估
-        y_pred = self.model.predict(X_scaled)
-        mae = mean_absolute_error(y, y_pred)
-        rmse = np.sqrt(mean_squared_error(y, y_pred))
-        r2 = r2_score(y, y_pred)
+        # 集成预测
+        rf_pred = rf_model.predict(X_test)
+        gb_pred = gb_model.predict(X_test)
+        ensemble_pred = 0.6 * rf_pred + 0.4 * gb_pred
         
-        print(f"模型训练完成:")
-        print(f"  MAE: {mae:.2f}")
-        print(f"  RMSE: {rmse:.2f}")
+        # 评估模型
+        mse = mean_squared_error(y_test, ensemble_pred)
+        r2 = r2_score(y_test, ensemble_pred)
+        
+        print(f"模型性能:")
+        print(f"  MSE: {mse:.2f}")
         print(f"  R²: {r2:.3f}")
+        print(f"  RMSE: {np.sqrt(mse):.2f}")
+        
+        # 保存训练好的模型
+        self.model = {
+            'rf': rf_model,
+            'gb': gb_model,
+            'weights': [0.6, 0.4]
+        }
+        
+        # 保存供应商统计信息用于预测
+        for _, row in stats_data.iterrows():
+            supplier_id = row['供应商统计数据']
+            self.supplier_stats[supplier_id] = row.to_dict()
+        
+        # 保存供货历史数据用于特征工程
+        self.supply_history = {}
+        week_columns = [col for col in supply_df.columns if col.startswith('W')]
+        for _, row in supply_df.iterrows():
+            supplier_id = row['供应商ID']
+            self.supply_history[supplier_id] = {
+                'material_type': row['材料分类'],
+                'history': row[week_columns].values
+            }
         
         self.is_trained = True
-        return True
-    
-    def predict_supplier(self, supplier_id, num_weeks=4):
-        """
-        预测指定供应商的未来供货量
-        
-        Args:
-            supplier_id: 供应商ID (如 'S229')
-            num_weeks: 预测周数
-            
-        Returns:
-            dict: 预测结果
-        """
-        if not self.is_trained:
-            raise ValueError("模型尚未训练")
-        
-        # 获取供应商历史数据
-        history, material_type = self.get_supplier_history(supplier_id)
-        
-        if history is None:
-            return None
-        
-        # print(f"\n供应商 {supplier_id} ({material_type}类材料):")
-        # print(f"  历史数据统计: 均值={np.mean(history[history>=0]):.2f}, 中位数={np.median(history[history>=0]):.2f}")
-        # print(f"  最大值={np.max(history):.2f}, 非零周数={np.sum(history>0)}")
-        
-        # 使用最近48周数据作为输入
-        recent_history = history[-48:]
-        predictions = []
-        
-        # 滚动预测
-        current_window = list(recent_history)
-        
-        for week in range(num_weeks):
-            # 构建特征 - 确保至少有48周的数据
-            if len(current_window) < 48:
-                # 如果历史数据不足48周，用0填充前面的部分
-                padded_window = [0] * (48 - len(current_window)) + current_window
-                input_window = np.array(padded_window[-48:])
-            else:
-                input_window = np.array(current_window[-48:])
-            
-            feature_vector = list(input_window)
-            
-            # 统计特征
-            valid_data = input_window[input_window >= 0]
-            if len(valid_data) > 0:
-                feature_vector.extend([
-                    np.mean(valid_data),
-                    np.std(valid_data),
-                    np.max(valid_data),
-                    np.min(valid_data),
-                    np.median(valid_data),
-                ])
-            else:
-                feature_vector.extend([0, 0, 0, 0, 0])
-            
-            # 趋势特征
-            if len(valid_data) >= 2:
-                trend = valid_data[-1] - valid_data[0]
-                volatility = np.std(valid_data) / (np.mean(valid_data) + 1e-8)
-                feature_vector.extend([trend, volatility])
-            else:
-                feature_vector.extend([0, 0])
-            
-            # 时间特征 (假设从第240周开始预测)
-            current_week = 240 + week
-            feature_vector.extend([
-                current_week % 52,
-                (current_week // 4) % 12,
-                current_week,
-            ])
-            
-            # 材料类型
-            material_encode = {'A': 1, 'B': 2, 'C': 3}.get(material_type, 0)
-            feature_vector.append(material_encode)
-            
-            # 预测
-            X_pred = self.scaler.transform([feature_vector])
-            prediction = self.model.predict(X_pred)[0]
-            
-            # 确保预测值为非负
-            prediction = max(0, prediction)
-            
-            predictions.append({
-                'week': week + 1,
-                'predicted_supply': prediction
-            })
-            
-            # 更新滑动窗口
-            current_window.append(prediction)
+        print("✓ 模型训练完成!")
         
         return {
-            'supplier_id': supplier_id,
-            'material_type': material_type,
-            'historical_stats': {
-                'mean': float(np.mean(history[history>=0])),
-                'median': float(np.median(history[history>=0])),
-                'max': float(np.max(history)),
-                'active_weeks': int(np.sum(history > 0))
-            },
-            'predictions': predictions
+            'mse': mse,
+            'r2': r2,
+            'rmse': np.sqrt(mse)
         }
     
-    def save_model(self, filepath='models/supplier_predictor_v2.pkl'):
-        """保存模型"""
+    def predict_supplier_supply(self, supplier_id, prediction_weeks, start_week=240):
+        """
+        预测指定供应商在未来几周的供货量
+        
+        参数:
+        - supplier_id: 供应商ID
+        - prediction_weeks: 预测周数
+        - start_week: 开始预测的周索引
+        
+        返回:
+        - predictions: 预测结果数组（包含不确定性）
+        """
         if not self.is_trained:
-            raise ValueError("模型尚未训练")
+            raise ValueError("模型尚未训练，请先调用 train_model() 方法")
         
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        if supplier_id not in self.supplier_stats:
+            raise ValueError(f"供应商 {supplier_id} 不在训练数据中")
         
-        model_data = {
-            'model': self.model,
-            'scaler': self.scaler,
-            'week_columns': self.week_columns
-        }
+        print(f"预测供应商 {supplier_id} 未来 {prediction_weeks} 周的供货量...")
         
-        joblib.dump(model_data, filepath)
-        print(f"模型已保存到: {filepath}")
-    
-    def load_model(self, filepath='models/supplier_predictor_v2.pkl'):
-        """加载模型"""
-        if not os.path.exists(filepath):
-            raise FileNotFoundError(f"模型文件不存在: {filepath}")
+        # 获取供应商的统计特征和历史数据
+        stats = self.supplier_stats[supplier_id]
+        history_info = self.supply_history[supplier_id]
+        material_type = history_info['material_type']
+        history = history_info['history']
         
-        model_data = joblib.load(filepath)
-        self.model = model_data['model']
-        self.scaler = model_data['scaler']
-        self.week_columns = model_data['week_columns']
-        self.is_trained = True
+        predictions = []
+        current_history = history.copy()  # 复制历史数据
         
-        print(f"模型已加载: {filepath}")
-
-
-def test_representative_suppliers():
-    """测试代表性供应商的预测效果"""
-    
-    # 创建并训练模型
-    predictor = SupplierPredictorV2()
-    
-    if not predictor.train():
-        print("模型训练失败")
-        return
-    
-    # 保存模型
-    predictor.save_model()
-    
-    print("\n" + "=" * 60)
-    print("测试代表性供应商预测效果")
-    print("=" * 60)
-    
-    # 测试三个代表性供应商
-    test_suppliers = ['S229', 'S348', 'S016']
-    
-    for supplier_id in test_suppliers:
-        result = predictor.predict_supplier(supplier_id, num_weeks=4)
-        
-        if result:
-            print(f"\n【{supplier_id}】预测结果:")
-            print(f"  材料类型: {result['material_type']}")
-            print(f"  历史平均: {result['historical_stats']['mean']:.2f}")
-            print(f"  历史中位数: {result['historical_stats']['median']:.2f}")
-            print(f"  历史最大值: {result['historical_stats']['max']:.2f}")
-            print(f"  活跃周数: {result['historical_stats']['active_weeks']}")
-            print("  未来4周预测:")
+        for week in range(prediction_weeks):
+            # 构建特征
+            features = {
+                'material_type_A': 1 if material_type == 'A' else 0,
+                'material_type_B': 1 if material_type == 'B' else 0,
+                'material_type_C': 1 if material_type == 'C' else 0,
+                'count': stats['计数'],
+                'mean': stats['平均值'],
+                'std': stats['标准差'],
+                'variance': stats['方差'],
+                'skewness': stats['偏度'] if pd.notna(stats['偏度']) else 0,
+                'kurtosis': stats['峰度'] if pd.notna(stats['峰度']) else 0,
+                'min_val': stats['最小值'],
+                'max_val': stats['最大值'],
+                'q25': stats['25%分位数'],
+                'q50': stats['50%分位数'],
+                'q75': stats['75%分位数'],
+                'q85': stats['85%分位数'],
+                'q90': stats['90%分位数'],
+                'cv': stats['变异系数']
+            }
             
-            for pred in result['predictions']:
-                print(f"    第{pred['week']}周: {pred['predicted_supply']:.2f}")
-        else:
-            print(f"\n【{supplier_id}】: 无法获取数据")
-
-
-# 快速调用函数
-def quick_predict(supplier_id, num_weeks=4, model_path='models/supplier_predictor_v2.pkl'):
-    """
-    快速预测函数 - 简化调用接口
-    
-    Args:
-        supplier_id: 供应商ID
-        num_weeks: 预测周数
-        model_path: 模型路径
-        
-    Returns:
-        list: 预测结果列表
-    """
-    try:
-        predictor = SupplierPredictorV2()
-        
-        # 尝试加载已有模型
-        if os.path.exists(model_path):
-            predictor.load_model(model_path)
-            predictor.load_data()  # 还需要加载数据
-        else:
-            # 重新训练
-            if not predictor.train():
-                return None
-            predictor.save_model(model_path)
-        
-        # 进行预测
-        result = predictor.predict_supplier(supplier_id, num_weeks)
-        
-        if result:
-            return [pred['predicted_supply'] for pred in result['predictions']]
-        else:
-            return None
+            # 最近的历史数据特征
+            recent_data = current_history[-8:]  # 最近8周
+            features.update({
+                f'lag_{j+1}': recent_data[-(j+1)] for j in range(min(4, len(recent_data)))
+            })
+            features.update({
+                'window_mean': np.mean(recent_data),
+                'window_std': np.std(recent_data),
+                'window_trend': (recent_data[-1] - recent_data[0]) / len(recent_data),
+                'week_in_year': (start_week + week) % 52
+            })
             
-    except Exception as e:
-        print(f"预测失败: {e}")
-        return None
+            # 确保特征顺序与训练时一致
+            feature_vector = []
+            for feat_name in self.features:
+                feature_vector.append(features.get(feat_name, 0))
+            
+            feature_vector = np.array(feature_vector).reshape(1, -1)
+            feature_vector_scaled = self.scaler.transform(feature_vector)
+            
+            # 集成预测
+            rf_pred = self.model['rf'].predict(feature_vector_scaled)[0]
+            gb_pred = self.model['gb'].predict(feature_vector_scaled)[0]
+            base_prediction = (self.model['weights'][0] * rf_pred + 
+                             self.model['weights'][1] * gb_pred)
+            
+            # 添加不确定性（基于历史波动性）
+            uncertainty_factor = stats['变异系数'] if pd.notna(stats['变异系数']) else 0.2
+            noise = np.random.normal(0, base_prediction * uncertainty_factor * 0.3)
+            final_prediction = max(0, base_prediction + noise)  # 确保非负
+            
+            predictions.append(final_prediction)
+            
+            # 更新历史数据（用于下一周预测）
+            current_history = np.append(current_history, final_prediction)
+        
+        return np.array(predictions)
+    
+    def batch_predict(self, supplier_ids, prediction_weeks):
+        """
+        批量预测多个供应商的供货量
+        
+        参数:
+        - supplier_ids: 供应商ID列表
+        - prediction_weeks: 预测周数
+        
+        返回:
+        - 字典，键为supplier_id，值为预测数组
+        """
+        results = {}
+        
+        print(f"批量预测 {len(supplier_ids)} 个供应商，{prediction_weeks} 周...")
+        
+        for i, supplier_id in enumerate(supplier_ids):
+            try:
+                predictions = self.predict_supplier_supply(supplier_id, prediction_weeks)
+                results[supplier_id] = predictions
+                
+                if (i + 1) % 20 == 0:  # 每20个输出一次进度
+                    print(f"  已完成 {i + 1}/{len(supplier_ids)} 个供应商")
+                    
+            except Exception as e:
+                print(f"  警告：供应商 {supplier_id} 预测失败: {e}")
+                # 使用历史平均值作为备选
+                if supplier_id in self.supplier_stats:
+                    avg_supply = self.supplier_stats[supplier_id]['平均值']
+                    std_supply = self.supplier_stats[supplier_id]['标准差']
+                    # 生成基于历史均值和标准差的随机预测
+                    predictions = np.random.normal(avg_supply, std_supply, prediction_weeks)
+                    predictions = np.maximum(predictions, 0)  # 确保非负
+                    results[supplier_id] = predictions
+                else:
+                    results[supplier_id] = np.zeros(prediction_weeks)
+        
+        print(f"✓ 批量预测完成")
+        return results
+
+
+# 全局模型实例
+_global_model = None
+
+def get_trained_model():
+    """获取训练好的全局模型实例"""
+    global _global_model
+    if _global_model is None or not _global_model.is_trained:
+        _global_model = SupplierPredictionModel()
+        _global_model.train_model()
+    return _global_model
+
+def predict_single_supplier(supplier_id, prediction_weeks):
+    """
+    预测单个供应商的供货量（对外接口）
+    
+    参数:
+    - supplier_id: 供应商ID
+    - prediction_weeks: 预测周数
+    
+    返回:
+    - 预测结果数组（包含不确定性）
+    """
+    model = get_trained_model()
+    return model.predict_supplier_supply(supplier_id, prediction_weeks)
+
+def predict_multiple_suppliers(supplier_ids, prediction_weeks):
+    """
+    批量预测多个供应商的供货量（对外接口）
+    
+    参数:
+    - supplier_ids: 供应商ID列表  
+    - prediction_weeks: 预测周数
+    
+    返回:
+    - 字典，键为supplier_id，值为预测数组
+    """
+    model = get_trained_model()
+    return model.batch_predict(supplier_ids, prediction_weeks)
 
 
 if __name__ == "__main__":
-    # 测试代表性供应商
-    test_representative_suppliers()
+    # 测试代码
+    print("开始测试ML预测模型...")
+    
+    # 训练模型
+    model = SupplierPredictionModel()
+    training_result = model.train_model()
+    
+    print(f"\n训练结果: {training_result}")
+    
+    # 测试预测
+    test_suppliers = ['S001', 'S002', 'S003']
+    test_weeks = 24
+    
+    print(f"\n测试预测 {test_suppliers}，{test_weeks} 周...")
+    
+    for supplier_id in test_suppliers:
+        try:
+            predictions = model.predict_supplier_supply(supplier_id, test_weeks)
+            print(f"供应商 {supplier_id}:")
+            print(f"  预测平均值: {np.mean(predictions):.2f}")
+            print(f"  预测标准差: {np.std(predictions):.2f}")
+            print(f"  预测范围: {np.min(predictions):.2f} - {np.max(predictions):.2f}")
+        except Exception as e:
+            print(f"供应商 {supplier_id} 预测失败: {e}")
+    
+    print("\n✓ 测试完成!")

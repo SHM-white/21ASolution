@@ -1,6 +1,7 @@
 """
-供应商供货量预测模型 - Version 2.0
+供应商供货量预测模型 - Version 2.1
 基于统计特征的机器学习预测模型
+新增功能：模型保存/加载、多线程预测、GPU加速支持
 """
 
 import pandas as pd
@@ -9,6 +10,10 @@ from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, r2_score
+import joblib
+import os
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from tqdm import tqdm
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -16,13 +21,82 @@ warnings.filterwarnings('ignore')
 class SupplierPredictionModel:
     """供应商供货量预测模型"""
     
-    def __init__(self):
+    def __init__(self, model_save_path='models/'):
         self.model = None
         self.scaler = StandardScaler()
         self.features = None
         self.is_trained = False
         self.supplier_stats = {}
+        self.model_save_path = model_save_path
+        self.model_file = os.path.join(model_save_path, 'supplier_prediction_model.pkl')
         
+        # 创建模型保存目录
+        os.makedirs(model_save_path, exist_ok=True)
+        
+        # 尝试检测GPU支持
+        self.use_gpu = self._check_gpu_support()
+        
+    def _check_gpu_support(self):
+        """检测GPU支持"""
+        try:
+            # 检测XGBoost GPU支持
+            import xgboost as xgb
+            if hasattr(xgb, 'cuda') and xgb.cuda.is_cuda_available():
+                print("✓ 检测到XGBoost GPU支持")
+                return True
+        except ImportError:
+            pass
+        
+        print("⚠ 未检测到GPU支持，使用CPU模式")
+        return False
+        
+    def save_model(self):
+        """保存训练好的模型"""
+        if not self.is_trained:
+            print("⚠ 模型尚未训练，无法保存")
+            return False
+        
+        try:
+            model_data = {
+                'model': self.model,
+                'scaler': self.scaler,
+                'features': self.features,
+                'supplier_stats': self.supplier_stats,
+                'supply_history': self.supply_history,
+                'is_trained': self.is_trained
+            }
+            
+            joblib.dump(model_data, self.model_file)
+            print(f"✓ 模型已保存到: {self.model_file}")
+            return True
+            
+        except Exception as e:
+            print(f"✗ 模型保存失败: {e}")
+            return False
+    
+    def load_model(self):
+        """加载预训练模型"""
+        if not os.path.exists(self.model_file):
+            print(f"⚠ 模型文件不存在: {self.model_file}")
+            return False
+        
+        try:
+            model_data = joblib.load(self.model_file)
+            
+            self.model = model_data['model']
+            self.scaler = model_data['scaler']
+            self.features = model_data['features']
+            self.supplier_stats = model_data['supplier_stats']
+            self.supply_history = model_data['supply_history']
+            self.is_trained = model_data['is_trained']
+            
+            print(f"✓ 模型已从文件加载: {self.model_file}")
+            return True
+            
+        except Exception as e:
+            print(f"✗ 模型加载失败: {e}")
+            return False
+    
     def load_data(self):
         """加载训练数据"""
         print("加载数据文件...")
@@ -61,7 +135,8 @@ class SupplierPredictionModel:
         
         training_samples = []
         
-        for _, supplier_row in supply_df.iterrows():
+        # 使用tqdm显示进度
+        for _, supplier_row in tqdm(supply_df.iterrows(), total=len(supply_df), desc="处理供应商"):
             supplier_id = supplier_row['供应商ID']
             material_type = supplier_row['材料分类']
             
@@ -174,17 +249,41 @@ class SupplierPredictionModel:
             min_samples_split=5,
             min_samples_leaf=2,
             random_state=42,
-            n_jobs=-1
+            n_jobs=-1  # 使用所有CPU核心
         )
         rf_model.fit(X_train, y_train)
         
         print("训练梯度提升模型...")
-        gb_model = GradientBoostingRegressor(
-            n_estimators=100,
-            max_depth=8,
-            learning_rate=0.1,
-            random_state=42
-        )
+        if self.use_gpu:
+            try:
+                # 尝试使用GPU加速的XGBoost
+                import xgboost as xgb
+                gb_model = xgb.XGBRegressor(
+                    n_estimators=100,
+                    max_depth=8,
+                    learning_rate=0.1,
+                    random_state=42,
+                    tree_method='gpu_hist',
+                    gpu_id=0
+                )
+                print("✓ 使用GPU加速XGBoost")
+            except:
+                # 回退到普通梯度提升
+                gb_model = GradientBoostingRegressor(
+                    n_estimators=100,
+                    max_depth=8,
+                    learning_rate=0.1,
+                    random_state=42
+                )
+                print("回退到CPU梯度提升")
+        else:
+            gb_model = GradientBoostingRegressor(
+                n_estimators=100,
+                max_depth=8,
+                learning_rate=0.1,
+                random_state=42
+            )
+        
         gb_model.fit(X_train, y_train)
         
         # 集成预测
@@ -224,6 +323,10 @@ class SupplierPredictionModel:
             }
         
         self.is_trained = True
+        
+        # 自动保存模型
+        self.save_model()
+        
         print("✓ 模型训练完成!")
         
         return {
@@ -249,8 +352,6 @@ class SupplierPredictionModel:
         
         if supplier_id not in self.supplier_stats:
             raise ValueError(f"供应商 {supplier_id} 不在训练数据中")
-        
-        print(f"预测供应商 {supplier_id} 未来 {prediction_weeks} 周的供货量...")
         
         # 获取供应商的统计特征和历史数据
         stats = self.supplier_stats[supplier_id]
@@ -321,55 +422,92 @@ class SupplierPredictionModel:
         
         return np.array(predictions)
     
-    def batch_predict(self, supplier_ids, prediction_weeks):
+    def _predict_single_supplier_worker(self, args):
+        """单个供应商预测的工作函数（用于并行处理）"""
+        supplier_id, prediction_weeks = args
+        try:
+            return supplier_id, self.predict_supplier_supply(supplier_id, prediction_weeks)
+        except Exception as e:
+            # 出错时返回基于历史均值的预测
+            if supplier_id in self.supplier_stats:
+                avg_supply = self.supplier_stats[supplier_id]['平均值']
+                std_supply = self.supplier_stats[supplier_id]['标准差']
+                predictions = np.random.normal(avg_supply, std_supply, prediction_weeks)
+                predictions = np.maximum(predictions, 0)
+                return supplier_id, predictions
+            else:
+                return supplier_id, np.zeros(prediction_weeks)
+    
+    def batch_predict(self, supplier_ids, prediction_weeks, use_multithread=True, max_workers=None):
         """
         批量预测多个供应商的供货量
         
         参数:
         - supplier_ids: 供应商ID列表
         - prediction_weeks: 预测周数
+        - use_multithread: 是否使用多线程
+        - max_workers: 最大工作线程数
         
         返回:
         - 字典，键为supplier_id，值为预测数组
         """
         results = {}
         
-        print(f"批量预测 {len(supplier_ids)} 个供应商，{prediction_weeks} 周...")
-        
-        for i, supplier_id in enumerate(supplier_ids):
-            try:
-                predictions = self.predict_supplier_supply(supplier_id, prediction_weeks)
-                results[supplier_id] = predictions
+        if use_multithread and len(supplier_ids) > 5:
+            # 使用多线程并行预测
+            if max_workers is None:
+                max_workers = min(32, (os.cpu_count() or 1) + 4)
+            
+            # 准备任务列表
+            tasks = [(supplier_id, prediction_weeks) for supplier_id in supplier_ids]
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # 使用tqdm显示进度
+                futures = [executor.submit(self._predict_single_supplier_worker, task) for task in tasks]
                 
-                if (i + 1) % 20 == 0:  # 每20个输出一次进度
-                    print(f"  已完成 {i + 1}/{len(supplier_ids)} 个供应商")
-                    
-            except Exception as e:
-                print(f"  警告：供应商 {supplier_id} 预测失败: {e}")
-                # 使用历史平均值作为备选
-                if supplier_id in self.supplier_stats:
-                    avg_supply = self.supplier_stats[supplier_id]['平均值']
-                    std_supply = self.supplier_stats[supplier_id]['标准差']
-                    # 生成基于历史均值和标准差的随机预测
-                    predictions = np.random.normal(avg_supply, std_supply, prediction_weeks)
-                    predictions = np.maximum(predictions, 0)  # 确保非负
+                for future in tqdm(futures, desc="批量预测", leave=False):
+                    supplier_id, predictions = future.result()
                     results[supplier_id] = predictions
-                else:
-                    results[supplier_id] = np.zeros(prediction_weeks)
+        else:
+            # 单线程顺序预测
+            for supplier_id in tqdm(supplier_ids, desc="批量预测", leave=False):
+                try:
+                    predictions = self.predict_supplier_supply(supplier_id, prediction_weeks)
+                    results[supplier_id] = predictions
+                except Exception as e:
+                    # 使用历史平均值作为备选
+                    if supplier_id in self.supplier_stats:
+                        avg_supply = self.supplier_stats[supplier_id]['平均值']
+                        std_supply = self.supplier_stats[supplier_id]['标准差']
+                        predictions = np.random.normal(avg_supply, std_supply, prediction_weeks)
+                        predictions = np.maximum(predictions, 0)
+                        results[supplier_id] = predictions
+                    else:
+                        results[supplier_id] = np.zeros(prediction_weeks)
         
-        print(f"✓ 批量预测完成")
         return results
 
 
 # 全局模型实例
 _global_model = None
 
-def get_trained_model():
+def get_trained_model(force_retrain=False):
     """获取训练好的全局模型实例"""
     global _global_model
-    if _global_model is None or not _global_model.is_trained:
+    
+    if _global_model is None:
         _global_model = SupplierPredictionModel()
+    
+    # 首先尝试加载已有模型
+    if not force_retrain and not _global_model.is_trained:
+        loaded = _global_model.load_model()
+        if not loaded:
+            print("未找到预训练模型，开始训练新模型...")
+            _global_model.train_model()
+    elif force_retrain:
+        print("强制重新训练模型...")
         _global_model.train_model()
+    
     return _global_model
 
 def predict_single_supplier(supplier_id, prediction_weeks):
@@ -386,30 +524,28 @@ def predict_single_supplier(supplier_id, prediction_weeks):
     model = get_trained_model()
     return model.predict_supplier_supply(supplier_id, prediction_weeks)
 
-def predict_multiple_suppliers(supplier_ids, prediction_weeks):
+def predict_multiple_suppliers(supplier_ids, prediction_weeks, use_multithread=True):
     """
     批量预测多个供应商的供货量（对外接口）
     
     参数:
     - supplier_ids: 供应商ID列表  
     - prediction_weeks: 预测周数
+    - use_multithread: 是否使用多线程
     
     返回:
     - 字典，键为supplier_id，值为预测数组
     """
     model = get_trained_model()
-    return model.batch_predict(supplier_ids, prediction_weeks)
+    return model.batch_predict(supplier_ids, prediction_weeks, use_multithread=use_multithread)
 
 
 if __name__ == "__main__":
     # 测试代码
     print("开始测试ML预测模型...")
     
-    # 训练模型
-    model = SupplierPredictionModel()
-    training_result = model.train_model()
-    
-    print(f"\n训练结果: {training_result}")
+    # 获取训练好的模型（自动加载或训练）
+    model = get_trained_model()
     
     # 测试预测
     test_suppliers = ['S001', 'S002', 'S003']
@@ -417,6 +553,7 @@ if __name__ == "__main__":
     
     print(f"\n测试预测 {test_suppliers}，{test_weeks} 周...")
     
+    # 测试单个预测
     for supplier_id in test_suppliers:
         try:
             predictions = model.predict_supplier_supply(supplier_id, test_weeks)
@@ -426,5 +563,12 @@ if __name__ == "__main__":
             print(f"  预测范围: {np.min(predictions):.2f} - {np.max(predictions):.2f}")
         except Exception as e:
             print(f"供应商 {supplier_id} 预测失败: {e}")
+    
+    # 测试批量预测（多线程）
+    print(f"\n测试批量预测（多线程）...")
+    batch_results = model.batch_predict(test_suppliers, test_weeks, use_multithread=True)
+    
+    for supplier_id, predictions in batch_results.items():
+        print(f"供应商 {supplier_id}: 均值 {np.mean(predictions):.2f}, 标准差 {np.std(predictions):.2f}")
     
     print("\n✓ 测试完成!")

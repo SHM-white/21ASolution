@@ -119,7 +119,7 @@ class MonteCarloSimulator:
             
             try:
                 # 使用ML模型预测每个供应商的供货量
-                predictions = predict_multiple_suppliers(supplier_ids, self.planning_weeks)
+                predictions = predict_multiple_suppliers(supplier_ids, self.planning_weeks, use_multithread=True)
                 
                 # 计算每周的总制造能力
                 weekly_capacities = []
@@ -335,7 +335,7 @@ def main():
     
     # 执行分析
     try:
-        result = simulator.find_minimum_suppliers(max_suppliers=80, step_size=5)
+        result = simulator.find_minimum_suppliers(max_suppliers=402, step_size=10)
         
         if result:
             print(f"\n分析成功完成!")

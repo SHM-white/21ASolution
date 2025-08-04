@@ -26,7 +26,7 @@ log_file = f'log/monte_carlo_simulation_{timestamp}.log'
 logging.basicConfig(filename=log_file, level=logging.INFO)
 logging.info("蒙特卡洛模拟器启动")
 
-num_simulations = 100
+num_simulations = 50
 
 class MonteCarloSimulator:
     """蒙特卡洛模拟器"""
@@ -34,8 +34,8 @@ class MonteCarloSimulator:
     def __init__(self):
         self.target_weekly_capacity = 28200  # 企业周产能需求（立方米）
         self.planning_weeks = 24  # 规划周数
-        self.safety_margin = 0.98  # 安全边际 (-2%)
-        self.success_threshold = 0.90  # 成功率阈值 (90%)
+        self.safety_margin = 1.005  # 安全边际 (0.5%)
+        self.success_threshold = 0.50  # 成功率阈值 (50%)
         self.target_total_capacity_for_week = []
         for week in range(self.planning_weeks):
             self.target_total_capacity_for_week.append(

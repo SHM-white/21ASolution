@@ -26,7 +26,7 @@ log_file = f'log/monte_carlo_simulation_{timestamp}.log'
 logging.basicConfig(filename=log_file, level=logging.INFO)
 logging.info("蒙特卡洛模拟器启动")
 
-num_simulations = 50
+num_simulations = 10
 
 class MonteCarloSimulator:
     """蒙特卡洛模拟器"""
@@ -34,8 +34,9 @@ class MonteCarloSimulator:
     def __init__(self):
         self.target_weekly_capacity = 28200  # 企业周产能需求（立方米）
         self.planning_weeks = 24  # 规划周数
-        self.safety_margin = 1.005  # 安全边际 (0.5%)
+        self.safety_margin = 0.9  # 安全边际 (-10%)
         self.success_threshold = 0.50  # 成功率阈值 (50%)
+        self.loss_rate = 0.995  # 转运商损耗率 (0.5%)
         self.target_total_capacity_for_week = []
         for week in range(self.planning_weeks):
             self.target_total_capacity_for_week.append(
@@ -158,7 +159,7 @@ class MonteCarloSimulator:
                 total_capacity.append(np.sum(weekly_capacities[:week+1]))
             
             # 检查是否所有周的累计产能都达到了目标
-            is_success = np.all(np.array(total_capacity) >= np.array(self.target_total_capacity_for_week) * self.safety_margin)
+            is_success = np.all(np.array(total_capacity) * self.loss_rate >= np.array(self.target_total_capacity_for_week) * self.safety_margin)
 
             logging.info(f"模拟 {sim_id} 完成（供货商数量：{len(selected_suppliers)}: 成功={is_success}, 最低周产能={min(weekly_capacities)}, 最高周产能={max(weekly_capacities)}")
 
@@ -188,9 +189,9 @@ class MonteCarloSimulator:
             total_capacity = []
             for week in range(self.planning_weeks):
                 total_capacity.append(np.sum(weekly_capacities[:week+1]))
-            
-            is_success = np.all(np.array(total_capacity) >= np.array(self.target_total_capacity_for_week) * self.safety_margin)
-            
+
+            is_success = np.all(np.array(total_capacity) * self.loss_rate >= np.array(self.target_total_capacity_for_week) * self.safety_margin)
+
             logging.info(f"模拟 {sim_id} 使用备选方法完成（供货商数量：{len(selected_suppliers)}: 成功={is_success}, 最低周产能={min(weekly_capacities)}, 最高周产能={max(weekly_capacities)}")
             
             return {
@@ -223,8 +224,8 @@ class MonteCarloSimulator:
         
         # 设置多线程参数
         if max_workers is None:
-            max_workers = min(32, (os.cpu_count() or 1), num_simulations)  # 限制线程数
-        
+            max_workers = min(64, (os.cpu_count() or 1) * 2, num_simulations)  # 限制线程数
+
         success_count = 0
         weekly_capacities_all = []
         min_weekly_capacities = []
@@ -385,7 +386,7 @@ class MonteCarloSimulator:
                 selected_suppliers, 
                 num_simulations=num_simulations, 
                 show_progress=False,  # 多线程时不显示内部进度
-                max_workers=32  # 限制内部线程数，避免过度竞争
+                max_workers=256  # 限制内部线程数，避免过度竞争
             )
             
             # 添加供应商组成信息
@@ -448,7 +449,7 @@ class MonteCarloSimulator:
         if use_multithread and len(test_counts) > 1:
             # 多线程并行测试
             if max_workers is None:
-                max_workers = min(32, (os.cpu_count() or 1))  # 限制最大线程数，避免过度消耗资源
+                max_workers = min(128, (os.cpu_count() or 1) * 4)  # 限制最大线程数，避免过度消耗资源
             
             print(f"🚀 使用多线程模式，最大线程数: {max_workers}")
             print("=" * 60)
@@ -515,7 +516,7 @@ class MonteCarloSimulator:
                 simulation_result = self.simulate_supply_scenario(
                     selected_suppliers, 
                     num_simulations=100,
-                    max_workers=32  # 单线程模式下可以使用更多线程
+                    max_workers=256  # 单线程模式下可以使用更多线程
                 )
                 
                 results.append(simulation_result)
@@ -623,7 +624,7 @@ def main():
             step_size=20, 
             use_multithread=True,
             start_count=1,
-            max_workers=32  # 限制线程数，避免过度消耗资源
+            max_workers=256  # 限制线程数，避免过度消耗资源
         )
         
         if result:

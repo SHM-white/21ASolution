@@ -45,9 +45,9 @@ class TimeSeriesSupplierPredictor:
         
         # 预测方法权重
         self.method_weights = {
-            'arima': 0.3,
+            'arima': 0.4,
             'holt_winters': 0.4,
-            'trend_extrapolation': 0.2,
+            'trend_extrapolation': 0.1,
             'moving_average': 0.1
         }
         
@@ -326,7 +326,7 @@ class TimeSeriesSupplierPredictor:
         
         if use_multithread and len(supplier_ids) > 10:
             if max_workers is None:
-                max_workers = min(32, (os.cpu_count() or 1))
+                max_workers = min(64, (os.cpu_count() or 1) * 2)
             
             print(f"使用多线程训练，线程数: {max_workers}")
             
@@ -454,7 +454,7 @@ class TimeSeriesSupplierPredictor:
         
         if use_multithread and len(supplier_ids) > 5:
             if max_workers is None:
-                max_workers = min(32, (os.cpu_count() or 1) * 2)
+                max_workers = min(256, (os.cpu_count() or 1) * 8)
             
             def predict_single(supplier_id):
                 return supplier_id, self.predict_supplier_supply(supplier_id, prediction_weeks)

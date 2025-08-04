@@ -263,7 +263,8 @@ class SupplierPredictionModel:
                     max_depth=8,
                     learning_rate=0.1,
                     random_state=42,
-                    tree_method='gpu_hist',
+                    tree_method='hist',
+                    device='cuda',  # 使用GPU
                     gpu_id=0
                 )
                 print("✓ 使用GPU加速XGBoost")

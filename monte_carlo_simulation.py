@@ -26,7 +26,7 @@ log_file = f'log/monte_carlo_simulation_{timestamp}.log'
 logging.basicConfig(filename=log_file, level=logging.INFO)
 logging.info("蒙特卡洛模拟器启动")
 
-num_simulations = 200
+num_simulations = 300
 
 class MonteCarloSimulator:
     """
@@ -40,7 +40,7 @@ class MonteCarloSimulator:
         self.safety_margin = 0.975  # 安全边际 (-2.5%)
         self.success_threshold = 0.65  # 成功率阈值 (65%) - 更合理的要求
         self.loss_rate = 0.995  # 转运商损耗率 (0.5%)
-        self.target_achievement_ratio = 0.60  # 目标达成率 (60%)
+        self.target_achievement_ratio = 0.7  # 目标达成率 (70%)
         self.target_total_capacity_for_week = []
         for week in range(self.planning_weeks):
             self.target_total_capacity_for_week.append(
@@ -493,8 +493,8 @@ class MonteCarloSimulator:
             # 多线程并行测试
             if max_workers is None:
                 max_workers = min(128, (os.cpu_count() or 1) * 4)  # 限制最大线程数，避免过度消耗资源
-            
-            print(f"🚀 使用多线程模式，最大线程数: {max_workers}")
+
+            print(f"🚀 使用多线程模式，最大线程数: {max_workers} ，模拟次数: {num_simulations}")
             print("=" * 60)
             
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -670,10 +670,10 @@ def main():
     # 执行分析
     try:
         result = simulator.find_minimum_suppliers(
-            max_suppliers=95, 
-            step_size=5, 
+            max_suppliers=90, 
+            step_size=2, 
             use_multithread=True,
-            start_count=70,
+            start_count=80,
             max_workers=32  # 限制线程数，避免过度消耗资源
         )
         

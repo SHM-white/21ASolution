@@ -26,7 +26,7 @@ log_file = f'log/monte_carlo_simulation_{timestamp}.log'
 logging.basicConfig(filename=log_file, level=logging.INFO)
 logging.info("蒙特卡洛模拟器启动")
 
-num_simulations = 300
+num_simulations = 1000
 
 class MonteCarloSimulator:
     """
@@ -670,10 +670,10 @@ def main():
     # 执行分析
     try:
         result = simulator.find_minimum_suppliers(
-            max_suppliers=90, 
-            step_size=2, 
+            max_suppliers=86, 
+            step_size=1, 
             use_multithread=True,
-            start_count=80,
+            start_count=84,
             max_workers=32  # 限制线程数，避免过度消耗资源
         )
         

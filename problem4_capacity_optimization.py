@@ -259,19 +259,42 @@ class Problem4CapacityOptimizer:
         max_weekly_transport = 8 * self.transporter_capacity  # 8个转运商 × 6000立方米
         print(f"每周最大转运能力: {max_weekly_transport:,.0f} 立方米")
         
-        # 如果目标产能超过转运能力，需要调整
-        if self.optimal_capacity > max_weekly_transport:
-            print(f"⚠ 警告：目标产能({self.optimal_capacity:,.0f})超过转运能力({max_weekly_transport:,.0f})，调整目标产能")
-            adjusted_capacity = max_weekly_transport * 0.95  # 留5%余量
+        # 计算目标产能所需的原材料总量
+        # 按照当前产能的原材料配比计算：A类30%、B类33%、C类37%
+        weighted_conversion = 0.3 * self.material_conversion['A'] + 0.33 * self.material_conversion['B'] + 0.37 * self.material_conversion['C']
+        required_materials = self.optimal_capacity * weighted_conversion
+        
+        print(f"目标产能({self.optimal_capacity:,.0f}立方米/周)所需原材料: {required_materials:,.0f} 立方米/周")
+        print(f"加权平均原材料消耗率: {weighted_conversion:.3f}")
+        
+        # 检查是否超过转运能力
+        if required_materials > max_weekly_transport:  # 留5%余量
+            print(f"⚠ 警告：所需原材料({required_materials:,.0f})超过转运能力({max_weekly_transport:,.0f})，调整目标产能")
+            adjusted_capacity = (max_weekly_transport) / weighted_conversion
             print(f"调整后目标产能: {adjusted_capacity:,.0f} 立方米/周")
         else:
             adjusted_capacity = self.optimal_capacity
+            print(f"✓ 转运能力充足，维持目标产能: {adjusted_capacity:,.0f} 立方米/周")
         
         # 计算每周原材料需求
         weekly_demands = {}
+        total_material_demand = 0
         for material, consumption in self.material_conversion.items():
             weekly_demands[material] = adjusted_capacity * consumption
+            total_material_demand += weekly_demands[material]
             print(f"  {material}类原材料需求: {weekly_demands[material]:,.0f} 立方米/周")
+        
+        print(f"  总原材料需求: {total_material_demand:,.0f} 立方米/周")
+        
+        # 检查总需求是否超过转运能力，如果超过则按比例调整
+        if total_material_demand > max_weekly_transport:
+            print(f"⚠ 警告：总原材料需求({total_material_demand:,.0f})超过转运能力({max_weekly_transport:,.0f})")
+            adjustment_factor = (max_weekly_transport) / total_material_demand
+            print(f"按比例调整系数: {adjustment_factor:.3f}")
+            
+            for material in weekly_demands:
+                weekly_demands[material] *= adjustment_factor
+                print(f"  调整后{material}类需求: {weekly_demands[material]:,.0f} 立方米/周")
         
         # 获取各供应商的预测供货能力
         supplier_predicted_capacity = {}
@@ -344,7 +367,7 @@ class Problem4CapacityOptimizer:
                         break
                     
                     # 检查是否会超过周转运能力
-                    if week_total_supply >= max_weekly_transport * 0.95:
+                    if week_total_supply >= max_weekly_transport:
                         break
                     
                     # 确定供应商的供货能力
@@ -358,9 +381,9 @@ class Problem4CapacityOptimizer:
                     # 限制单个供应商的供货量
                     supply_capacity = min(
                         base_capacity,
-                        self.transporter_capacity,  # 不超过单个转运商能力
+                        # 移除转运商单次运力限制，允许供应商向多个转运商供货
                         material_demand - allocated_demand,  # 不超过需求量
-                        max_weekly_transport * 0.95 - week_total_supply  # 不超过周转运余量
+                        max_weekly_transport - week_total_supply  # 不超过周转运余量
                     )
                     
                     if supply_capacity > 10:  # 最低订货量10立方米
@@ -380,7 +403,11 @@ class Problem4CapacityOptimizer:
                         supplier_count += 1
                 
                 if week == 1:  # 只在第一周显示详细信息
-                    predicted_count = sum(1 for s in week_supplies[-supplier_count:] if s.get('is_predicted', False))
+                    # 修正：只统计当前材料类型的供应商
+                    if supplier_count > 0:
+                        predicted_count = sum(1 for s in week_supplies[-supplier_count:] if s.get('is_predicted', False))
+                    else:
+                        predicted_count = 0
                     print(f"    第{week}周{material}类: 使用{supplier_count}家供应商(预测模型指导: {predicted_count}家), 分配{allocated_demand:,.0f}立方米")
             
             if week == 1:
@@ -422,63 +449,96 @@ class Problem4CapacityOptimizer:
                 material_type = supply['material_type']
                 supply_quantity = supply['supply_quantity']
                 
-                # 如果供货量超过单个转运商的运力，需要分拆到多个转运商
-                remaining_quantity = supply_quantity
+                # 优先寻找能够完整运输的转运商
+                best_transporter = None
+                min_loss_rate = float('inf')
                 
-                while remaining_quantity > 0:
-                    # 寻找最优转运商
-                    best_transporter = None
-                    max_available_capacity = 0
-                    min_loss_rate = float('inf')
+                # 第一轮：寻找有足够剩余运力的转运商
+                for _, transporter in sorted_transporters.iterrows():
+                    transporter_name = transporter['transporter_name']
+                    loss_rate = transporter['avg_loss_rate']
+                    remaining_capacity = self.transporter_capacity - transporter_usage[transporter_name]
                     
-                    for _, transporter in sorted_transporters.iterrows():
-                        transporter_name = transporter['transporter_name']
-                        loss_rate = transporter['avg_loss_rate']
-                        
-                        # 计算该转运商的剩余运力
-                        remaining_capacity = self.transporter_capacity - transporter_usage[transporter_name]
-                        
-                        if remaining_capacity > 0:
-                            # 优先选择损耗率低且有足够运力的转运商
-                            if loss_rate < min_loss_rate or (loss_rate == min_loss_rate and remaining_capacity > max_available_capacity):
-                                best_transporter = transporter_name
-                                min_loss_rate = loss_rate
-                                max_available_capacity = remaining_capacity
-                    
-                    # 如果没有找到可用转运商，选择使用率最低的
-                    if best_transporter is None:
-                        best_transporter = min(transporter_usage, key=transporter_usage.get)
-                        min_loss_rate = self.transporter_data[
-                            self.transporter_data['transporter_name'] == best_transporter
-                        ]['avg_loss_rate'].iloc[0]
-                        max_available_capacity = self.transporter_capacity - transporter_usage[best_transporter]
-                    
-                    # 计算本次分配的数量（不超过转运商剩余运力）
-                    allocated_quantity = min(remaining_quantity, max_available_capacity, self.transporter_capacity)
-                    
-                    if allocated_quantity <= 0:
-                        # 所有转运商都已达到满负荷，无法继续分配
-                        print(f"⚠ 警告：第{week}周转运商运力不足，剩余{remaining_quantity:.0f}立方米无法运输")
-                        break
-                    
-                    # 更新使用情况
-                    transporter_usage[best_transporter] += allocated_quantity
-                    remaining_quantity -= allocated_quantity
-                    
-                    # 计算损耗和接收量
-                    loss_quantity = allocated_quantity * min_loss_rate / 100
-                    received_quantity = allocated_quantity - loss_quantity
+                    # 如果该转运商能够完整运输
+                    if remaining_capacity >= supply_quantity:
+                        if loss_rate < min_loss_rate:
+                            best_transporter = transporter_name
+                            min_loss_rate = loss_rate
+                
+                # 如果找到了能完整运输的转运商，直接分配
+                if best_transporter is not None:
+                    transporter_usage[best_transporter] += supply_quantity
+                    loss_quantity = supply_quantity * min_loss_rate / 100
+                    received_quantity = supply_quantity - loss_quantity
                     
                     self.transport_plan.append({
                         'week': week,
                         'supplier_id': supplier_id,
                         'material_type': material_type,
                         'transporter_name': best_transporter,
-                        'supply_quantity': allocated_quantity,
+                        'supply_quantity': supply_quantity,
                         'loss_rate': min_loss_rate,
                         'loss_quantity': loss_quantity,
                         'received_quantity': received_quantity
                     })
+                else:
+                    # 没有单个转运商能完整运输，需要分拆到多个转运商
+                    remaining_quantity = supply_quantity
+                    
+                    while remaining_quantity > 0:
+                        # 寻找最优转运商
+                        best_transporter = None
+                        max_available_capacity = 0
+                        min_loss_rate = float('inf')
+                        
+                        for _, transporter in sorted_transporters.iterrows():
+                            transporter_name = transporter['transporter_name']
+                            loss_rate = transporter['avg_loss_rate']
+                            
+                            # 计算该转运商的剩余运力
+                            remaining_capacity = self.transporter_capacity - transporter_usage[transporter_name]
+                            
+                            if remaining_capacity > 0:
+                                # 优先选择损耗率低且有足够运力的转运商
+                                if loss_rate < min_loss_rate or (loss_rate == min_loss_rate and remaining_capacity > max_available_capacity):
+                                    best_transporter = transporter_name
+                                    min_loss_rate = loss_rate
+                                    max_available_capacity = remaining_capacity
+                        
+                        # 如果没有找到可用转运商，选择使用率最低的
+                        if best_transporter is None:
+                            best_transporter = min(transporter_usage, key=transporter_usage.get)
+                            min_loss_rate = self.transporter_data[
+                                self.transporter_data['transporter_name'] == best_transporter
+                            ]['avg_loss_rate'].iloc[0]
+                            max_available_capacity = self.transporter_capacity - transporter_usage[best_transporter]
+                        
+                        # 计算本次分配的数量（不超过转运商剩余运力）
+                        allocated_quantity = min(remaining_quantity, max_available_capacity, self.transporter_capacity)
+                        
+                        if allocated_quantity <= 0:
+                            # 所有转运商都已达到满负荷，无法继续分配
+                            print(f"⚠ 警告：第{week}周转运商运力不足，剩余{remaining_quantity:.0f}立方米无法运输")
+                            break
+                        
+                        # 更新使用情况
+                        transporter_usage[best_transporter] += allocated_quantity
+                        remaining_quantity -= allocated_quantity
+                        
+                        # 计算损耗和接收量
+                        loss_quantity = allocated_quantity * min_loss_rate / 100
+                        received_quantity = allocated_quantity - loss_quantity
+                        
+                        self.transport_plan.append({
+                            'week': week,
+                            'supplier_id': supplier_id,
+                            'material_type': material_type,
+                            'transporter_name': best_transporter,
+                            'supply_quantity': allocated_quantity,
+                            'loss_rate': min_loss_rate,
+                            'loss_quantity': loss_quantity,
+                            'received_quantity': received_quantity
+                        })
         
         self.transport_plan = pd.DataFrame(self.transport_plan)
         print(f"✓ 转运方案生成完成，共{len(self.transport_plan)}条记录")

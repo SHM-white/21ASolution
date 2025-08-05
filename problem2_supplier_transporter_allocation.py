@@ -57,7 +57,8 @@ class SupplierTransporterAllocator:
         self.planning_weeks = 24  # 规划周数
         self.safety_margin = 1.0  # 安全边际 (-2.5%)
         self.transporter_capacity = 6000  # 每家转运商运输能力（立方米/周）
-        
+        self.prediction_adjustment_factor = 1.05 # 预测微调乘数
+
         # 材料转换系数（原材料 -> 产品）
         self.material_conversion = {
             'A': 1/0.6,    # 1.6667 - 每1立方米A类原材料可制造1.6667立方米产品
@@ -74,6 +75,10 @@ class SupplierTransporterAllocator:
         
         # 可手动调整的供应商数量
         self.num_suppliers = 85  # 默认85家供应商，可手动调整
+        
+        # 自动重试配置
+        self.max_retry_attempts = 5  # 最大重试次数
+        self.retry_increment = 0  # 每次增加的供应商数量
 
         # 成功判断标准：24周100%达标
         self.target_achievement_ratio = 1.0  # 100%周期达标
@@ -87,9 +92,16 @@ class SupplierTransporterAllocator:
         
     def set_supplier_count(self, count):
         """设置供应商数量（可手动调整）"""
-        self.num_suppliers = max(1, min(count, 402))  # 限制在1-402之间
+        self.num_suppliers = max(0, min(count, 402))  # 限制在0-402之间
         logging.info(f"设置供应商数量为: {self.num_suppliers}")
         print(f"供应商数量已设置为: {self.num_suppliers}")
+    
+    def set_retry_config(self, max_attempts=5, increment=20):
+        """设置自动重试配置"""
+        self.max_retry_attempts = max(1, max_attempts)
+        self.retry_increment = max(0, min(increment, 50))  # 限制增量在0-50之间
+        logging.info(f"重试配置: 最大尝试次数={self.max_retry_attempts}, 每次增加={self.retry_increment}家供应商")
+        print(f"重试配置已更新: 最大尝试次数={self.max_retry_attempts}, 每次增加={self.retry_increment}家供应商")
     
     def load_data(self):
         """加载基础数据"""
@@ -223,80 +235,123 @@ class SupplierTransporterAllocator:
         
         print(f"    可用转运商数量: {len(self.transporter_data)}")
     
-    def generate_optimal_supply_plan(self):
-        """生成满足24周100%达标的最优供货计划"""
+    def generate_optimal_supply_plan(self, auto_retry=True):
+        """生成满足24周100%达标的最优供货计划（支持自动重试）"""
         print(f"\n正在生成满足100%达标的供货计划（供应商数量: {self.num_suppliers}）...")
         logging.info(f"开始生成供货计划，供应商数量: {self.num_suppliers}")
         
-        # 选择Top N供应商
-        self.selected_suppliers = self.supplier_pool.head(self.num_suppliers).copy()
+        retry_count = 0
+        original_num_suppliers = self.num_suppliers
         
-        print(f"选定供应商组成:")
-        material_counts = self.selected_suppliers['material_type'].value_counts()
-        for material in ['A', 'B', 'C']:
-            count = material_counts.get(material, 0)
-            total_capacity = self.selected_suppliers[
-                self.selected_suppliers['material_type'] == material
-            ]['avg_weekly_capacity'].sum()
-            print(f"  {material}类: {count}家, 总产能: {total_capacity:.0f}")
-        
-        # 使用预测模型生成供货量
-        supplier_ids = self.selected_suppliers['supplier_id'].tolist()
-        print("正在调用预测模型生成24周供货量...")
-        
-        predictions = None
-        if predict_multiple_suppliers is not None:
-            try:
-                predictions = predict_multiple_suppliers(supplier_ids, self.planning_weeks, use_multithread=True)
-                print(f"预测完成，获得 {len(predictions)} 家供应商的预测数据")
-            except Exception as e:
-                print(f"预测模型调用失败: {e}")
-                logging.error(f"预测模型调用失败: {e}")
-                predictions = None
-        
-        if predictions is None:
-            print("使用备选方法生成供货量...")
-            predictions = self._generate_fallback_predictions(supplier_ids)
-        
-        # 生成供货计划表
-        supply_plan = []
-        for week in range(self.planning_weeks):
-            week_supplies = []
+        while retry_count <= self.max_retry_attempts:
+            if retry_count > 0:
+                print(f"\n第{retry_count}次重试，当前供应商数量: {self.num_suppliers}")
+                logging.info(f"第{retry_count}次重试，供应商数量: {self.num_suppliers}")
             
-            for _, supplier in self.selected_suppliers.iterrows():
-                supplier_id = supplier['supplier_id']
-                material_type = supplier['material_type']
-                conversion_factor = supplier['conversion_factor']
-                
-                if supplier_id in predictions:
-                    # 使用预测值
-                    raw_supply = predictions[supplier_id][week]
-                else:
-                    # 使用平均值作为备选
-                    raw_supply = supplier['avg_weekly_capacity']
-                
-                # 确保供货量非负
-                raw_supply = max(0, raw_supply)
-                
-                # 计算可制造的产品量
-                product_capacity = raw_supply * conversion_factor
-                
-                week_supplies.append({
-                    'week': week + 1,
-                    'supplier_id': supplier_id,
-                    'material_type': material_type,
-                    'supply_quantity': raw_supply,
-                    'conversion_factor': conversion_factor,
-                    'product_capacity': product_capacity,
-                    'cost_multiplier': supplier['cost_multiplier']
-                })
+            # 选择Top N供应商
+            self.selected_suppliers = self.supplier_pool.head(self.num_suppliers).copy()
             
-            supply_plan.extend(week_supplies)
+            print(f"选定供应商组成:")
+            material_counts = self.selected_suppliers['material_type'].value_counts()
+            for material in ['A', 'B', 'C']:
+                count = material_counts.get(material, 0)
+                total_capacity = self.selected_suppliers[
+                    self.selected_suppliers['material_type'] == material
+                ]['avg_weekly_capacity'].sum()
+                print(f"  {material}类: {count}家, 总产能: {total_capacity:.0f}")
+            
+            # 使用预测模型生成供货量
+            supplier_ids = self.selected_suppliers['supplier_id'].tolist()
+            print("正在调用预测模型生成24周供货量...")
+            
+            predictions = None
+            if predict_multiple_suppliers is not None:
+                try:
+                    predictions = predict_multiple_suppliers(supplier_ids, self.planning_weeks, use_multithread=True)
+                    print(f"预测完成，获得 {len(predictions)} 家供应商的预测数据")
+                except Exception as e:
+                    print(f"预测模型调用失败: {e}")
+                    logging.error(f"预测模型调用失败: {e}")
+                    predictions = None
+            
+            if predictions is None:
+                print("使用备选方法生成供货量...")
+                predictions = self._generate_fallback_predictions(supplier_ids)
+            
+            # 将预测值调整并向上取整
+            predictions = {k: np.ceil(v * self.prediction_adjustment_factor).astype(int) for k, v in predictions.items()}
+
+            # 生成供货计划表
+            supply_plan = []
+            for week in range(self.planning_weeks):
+                week_supplies = []
+                
+                for _, supplier in self.selected_suppliers.iterrows():
+                    supplier_id = supplier['supplier_id']
+                    material_type = supplier['material_type']
+                    conversion_factor = supplier['conversion_factor']
+                    
+                    if supplier_id in predictions:
+                        # 使用预测值
+                        raw_supply = predictions[supplier_id][week]
+                    else:
+                        # 使用平均值作为备选
+                        raw_supply = supplier['avg_weekly_capacity']
+                    
+                    # 确保供货量非负
+                    raw_supply = max(0, raw_supply)
+                    
+                    # 计算可制造的产品量
+                    product_capacity = raw_supply * conversion_factor
+                    
+                    week_supplies.append({
+                        'week': week + 1,
+                        'supplier_id': supplier_id,
+                        'material_type': material_type,
+                        'supply_quantity': raw_supply,
+                        'conversion_factor': conversion_factor,
+                        'product_capacity': product_capacity,
+                        'cost_multiplier': supplier['cost_multiplier']
+                    })
+                
+                supply_plan.extend(week_supplies)
+            
+            self.supply_plan = pd.DataFrame(supply_plan)
+            
+            # 验证供货计划是否满足100%达标要求
+            is_success = self._validate_supply_plan()
+            
+            if is_success or not auto_retry:
+                # 成功达标或不自动重试，退出循环
+                break
+            
+            # 未达标且可以重试
+            if retry_count < self.max_retry_attempts:
+                # 增加供应商数量
+                new_count = min(402, self.num_suppliers + self.retry_increment)
+                if new_count == self.num_suppliers:
+                    # 已达到最大供应商数量，无法继续增加
+                    print(f"⚠️  已达到最大供应商数量(402家)，无法继续增加")
+                    logging.warning("已达到最大供应商数量，停止重试")
+                    break
+                
+                print(f"📈 自动增加供应商数量: {self.num_suppliers} → {new_count}")
+                logging.info(f"自动增加供应商数量: {self.num_suppliers} → {new_count}")
+                self.num_suppliers = new_count
+                retry_count += 1
+            else:
+                # 达到最大重试次数
+                print(f"⚠️  已达到最大重试次数({self.max_retry_attempts})，停止重试")
+                logging.warning(f"达到最大重试次数({self.max_retry_attempts})，停止重试")
+                break
         
-        self.supply_plan = pd.DataFrame(supply_plan)
-        
-        # 验证供货计划是否满足100%达标要求
-        self._validate_supply_plan()
+        # 输出最终结果
+        if retry_count > 0:
+            print(f"\n📊 重试总结:")
+            print(f"  原始供应商数量: {original_num_suppliers}")
+            print(f"  最终供应商数量: {self.num_suppliers}")
+            print(f"  重试次数: {retry_count}")
+            logging.info(f"重试完成: 原始{original_num_suppliers} → 最终{self.num_suppliers}, 重试{retry_count}次")
         
         print("供货计划生成完成")
         logging.info("供货计划生成完成")
@@ -554,8 +609,8 @@ class SupplierTransporterAllocator:
         summary_file = dataFrame_dir / f"{filename_prefix}_summary.xlsx"
 
         # 按题目要求的附件A和附件B格式
-        attachment_a_file = dataFrame_dir / f"附件A_订购方案数据结果.xlsx"
-        attachment_b_file = dataFrame_dir / f"附件B_转运方案数据结果.xlsx"
+        attachment_a_file = dataFrame_dir / f"问题2_附件A_订购方案数据结果(格式不对).xlsx"
+        attachment_b_file = dataFrame_dir / f"问题2_附件B_转运方案数据结果(格式不对).xlsx"
 
         # 1. 导出供货计划
         if self.supply_plan is not None:
@@ -787,7 +842,7 @@ class SupplierTransporterAllocator:
         
         return 300  # 默认返回值
     
-    def run_complete_allocation(self, auto_find_minimum=False):
+    def run_complete_allocation(self, auto_find_minimum=False, auto_retry=True):
         """运行完整的分配流程"""
         print("="*60)
         print("第二问：供应商和转运商分配方案")
@@ -801,8 +856,8 @@ class SupplierTransporterAllocator:
             if auto_find_minimum:
                 self.find_minimum_suppliers_for_100_percent()
             
-            # 3. 生成供货计划
-            self.generate_optimal_supply_plan()
+            # 3. 生成供货计划（支持自动重试）
+            self.generate_optimal_supply_plan(auto_retry=auto_retry)
             
             # 4. 分配转运商
             self.allocate_transporters()
@@ -828,8 +883,9 @@ def main():
     print("运行模式选择:")
     print("1. 手动设置供应商数量")
     print("2. 自动寻找最少供应商数量（推荐）")
+    print("3. 启用自动重试模式")
     
-    mode = input("请选择模式 (1/2, 默认为2): ").strip()
+    mode = input("请选择模式 (1/2/3, 默认为3): ").strip()
     
     if mode == "1":
         # 手动模式
@@ -841,19 +897,51 @@ def main():
         except ValueError:
             print("输入无效，使用默认数量")
         
-        # 运行分配流程
-        allocator.run_complete_allocation(auto_find_minimum=False)
+        # 运行分配流程（不自动重试）
+        allocator.run_complete_allocation(auto_find_minimum=False, auto_retry=False)
+    
+    elif mode == "2":
+        # 自动寻找最小数量模式
+        print("\n将自动寻找满足100%达标的最少供应商数量...")
+        allocator.run_complete_allocation(auto_find_minimum=True, auto_retry=False)
     
     else:
-        # 自动模式（默认）
-        print("\n将自动寻找满足100%达标的最少供应商数量...")
-        allocator.run_complete_allocation(auto_find_minimum=True)
+        # 自动重试模式（默认）
+        print(f"\n自动重试模式:")
+        print(f"  当前供应商数量: {allocator.num_suppliers}")
+        print(f"  最大重试次数: {allocator.max_retry_attempts}")
+        print(f"  每次增加数量: {allocator.retry_increment}")
+        
+        # 询问是否修改重试配置
+        config_input = input("是否修改重试配置? (y/N): ").strip().lower()
+        if config_input in ['y', 'yes']:
+            try:
+                max_attempts = input(f"最大重试次数 (默认{allocator.max_retry_attempts}): ").strip()
+                increment = input(f"每次增加供应商数量 (默认{allocator.retry_increment}): ").strip()
+                
+                if max_attempts:
+                    max_attempts = int(max_attempts)
+                else:
+                    max_attempts = allocator.max_retry_attempts
+                    
+                if increment:
+                    increment = int(increment)
+                else:
+                    increment = allocator.retry_increment
+                
+                allocator.set_retry_config(max_attempts, increment)
+            except ValueError:
+                print("输入无效，使用默认配置")
+        
+        # 运行分配流程（启用自动重试）
+        allocator.run_complete_allocation(auto_find_minimum=False, auto_retry=True)
     
-    print("\n提示: 结果文件已保存到 results/ 目录")
+    print("\n提示: 结果文件已保存到 DataFrames/ 目录")
     print("包括:")
     print("- 供货计划详情")
     print("- 转运分配方案") 
     print("- 汇总分析报告")
+    print("- 附件A/B格式文件")
 
 if __name__ == "__main__":
     main()

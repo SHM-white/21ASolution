@@ -18,6 +18,9 @@ import logging
 import os
 from pathlib import Path
 
+# 导入预测模型
+from supplier_prediction_model_v3 import get_trained_timeseries_model, predict_multiple_suppliers
+
 warnings.filterwarnings('ignore')
 
 class Problem4CapacityOptimizer:
@@ -46,6 +49,9 @@ class Problem4CapacityOptimizer:
         self.supply_plan = []
         self.transport_plan = []
         
+        # 预测模型可用性
+        self.prediction_model_available = False
+        
     def load_data(self):
         """加载基础数据"""
         print("加载基础数据...")
@@ -59,13 +65,20 @@ class Problem4CapacityOptimizer:
         # 3. 加载转运商数据
         transporter_df = pd.read_excel('DataFrames/转运商损耗率分析结果.xlsx')
         
-        # 4. 加载供应商90%分位数数据（用于可持续供应能力计算）
+        # 4. 检查预测模型可用性
+        print("检查预测模型...")
         try:
-            percentile_df = pd.read_excel('DataFrames/供应商统计数据离散系数_重处理.xlsx')
-            print(f"✓ 加载90%分位数数据：{len(percentile_df)}条记录")
-        except FileNotFoundError:
-            print("⚠ 警告：未找到重处理的离散系数文件，将使用最大产能的80%作为备选方案")
-            percentile_df = None
+            # 简单测试预测模型是否可用
+            test_result = predict_multiple_suppliers(['S001'], 1, use_multithread=False)
+            if test_result and 'S001' in test_result:
+                self.prediction_model_available = True
+                print("✓ 预测模型可用")
+            else:
+                self.prediction_model_available = False
+                print("⚠ 预测模型测试失败")
+        except Exception as e:
+            self.prediction_model_available = False
+            print(f"⚠ 预测模型不可用: {e}")
         
         # 5. 构建供应商数据池
         supplier_pool = []
@@ -105,9 +118,6 @@ class Problem4CapacityOptimizer:
         
         self.supplier_data = pd.DataFrame(supplier_pool)
         
-        # 存储90%分位数数据供后续使用
-        self.percentile_data = percentile_df
-        
         # 5. 处理转运商数据
         self.transporter_data = transporter_df[['transporter_name', 'avg_loss_rate', 
                                                'stability_score', 'comprehensive_score']].copy()
@@ -127,40 +137,79 @@ class Problem4CapacityOptimizer:
                   f"Top50: {top50_count}家")
     
     def analyze_capacity_potential(self):
-        """分析产能提升潜力"""
-        print("\n分析产能提升潜力...")
+        """分析产能提升潜力（基于预测模型）"""
+        print("\n基于预测模型分析产能提升潜力...")
         
-        # 1. 分析各类材料的供应能力限制
+        # 1. 使用预测模型预测各供应商未来供货能力
         material_capacity_limits = {}
         
         for material in ['A', 'B', 'C']:
             material_suppliers = self.supplier_data[self.supplier_data['material_type'] == material]
+            supplier_ids = material_suppliers['supplier_id'].tolist()
             
-            # 计算可持续供应能力：优先使用90%分位数，否则使用最大产能的80%
-            if self.percentile_data is not None:
-                # 使用90%分位数作为可持续供应能力
-                material_percentile_data = self.percentile_data[
-                    self.percentile_data['材料分类'] == material
-                ]
-                
-                if not material_percentile_data.empty:
-                    # 按供应商数量加权计算90%分位数总产能
-                    sustainable_capacity = material_percentile_data['90%分位数'].sum()
-                    calculation_method = "90%分位数"
-                else:
-                    # 如果没有找到对应材料的90%分位数数据，回退到80%方法
-                    sustainable_capacity = material_suppliers['max_weekly_capacity'].sum() * 0.8
-                    calculation_method = "最大产能的80%（回退方案）"
+            print(f"  分析{material}类材料供应商({len(supplier_ids)}家)...")
+            
+            # 使用预测模型预测未来4周的供货量
+            if self.prediction_model_available:
+                try:
+                    # 使用直接的批量预测函数
+                    prediction_results = predict_multiple_suppliers(
+                        supplier_ids, 
+                        prediction_weeks=4, 
+                        use_multithread=True
+                    )
+                    
+                    # 计算各供应商的平均预测产能
+                    total_predicted_capacity = 0
+                    valid_predictions = 0
+                    
+                    for supplier_id in supplier_ids:
+                        if supplier_id in prediction_results:
+                            predictions = prediction_results[supplier_id]
+                            # 取预测值的90%分位数，避免极端值影响
+                            avg_prediction = np.percentile(predictions, 90)
+
+                            # 获取历史数据作为参考
+                            supplier_info = material_suppliers[material_suppliers['supplier_id'] == supplier_id]
+                            if not supplier_info.empty:
+                                max_capacity = supplier_info['max_weekly_capacity'].iloc[0]
+                                avg_capacity = supplier_info['avg_weekly_capacity'].iloc[0]
+                                
+                                # 使用预测值和历史最大值的加权平均，更均衡的配比
+                                # 预测值60%，历史最大值的80%权重40%
+                                optimistic_prediction = 0.6 * avg_prediction + 0.4 * (max_capacity * 0.8)
+                                
+                                # 限制在合理范围内：不超过历史最大值的130%，不低于历史平均值的50%
+                                optimistic_prediction = min(optimistic_prediction, max_capacity * 1.3)
+                                optimistic_prediction = max(optimistic_prediction, avg_capacity * 0.5)
+                            else:
+                                optimistic_prediction = avg_prediction
+                            
+                            total_predicted_capacity += max(optimistic_prediction, 0)
+                            valid_predictions += 1
+                    
+                    calculation_method = f"预测模型+历史数据加权({valid_predictions}/{len(supplier_ids)}家供应商)"
+                    
+                    if valid_predictions == 0:
+                        # 如果预测失败，回退到历史最大值的85%
+                        total_predicted_capacity = material_suppliers['max_weekly_capacity'].sum() * 0.85
+                        calculation_method = "历史最大值85%（预测模型失败回退方案）"
+                        
+                except Exception as e:
+                    print(f"    预测模型调用失败: {e}")
+                    # 回退到历史最大值的85%
+                    total_predicted_capacity = material_suppliers['max_weekly_capacity'].sum() * 0.85
+                    calculation_method = "历史最大值85%（预测模型异常回退方案）"
             else:
-                # 使用最大产能的80%作为可持续供应能力（考虑稳定性）
-                sustainable_capacity = material_suppliers['max_weekly_capacity'].sum() * 0.8
-                calculation_method = "最大产能的80%（备选方案）"
+                # 如果预测模型不可用，使用历史最大值的85%
+                total_predicted_capacity = material_suppliers['max_weekly_capacity'].sum() * 0.85
+                calculation_method = "历史最大值85%（无预测模型）"
             
             # 转换为产品制造能力
-            product_capacity = sustainable_capacity / self.material_conversion[material]
+            product_capacity = total_predicted_capacity / self.material_conversion[material]
             material_capacity_limits[material] = product_capacity
             
-            print(f"  {material}类材料可支持最大产能: {product_capacity:,.0f} 立方米/周 ({calculation_method})")
+            print(f"    {material}类材料可支持最大产能: {product_capacity:,.0f} 立方米/周 ({calculation_method})")
         
         # 2. 供应商限制的最大产能（受最小材料类型限制）
         supplier_limited_capacity = min(material_capacity_limits.values())
@@ -189,8 +238,7 @@ class Problem4CapacityOptimizer:
         increase_percentage = capacity_increase / self.current_weekly_capacity * 100
         
         print(f"\n=== 产能提升分析结果 ===")
-        calculation_note = "（基于90%分位数可持续供应能力）" if self.percentile_data is not None else "（基于最大产能80%）"
-        print(f"分析方法说明: 供应商可持续产能{calculation_note}")
+        print(f"分析方法说明: 基于时间序列预测模型的可持续供应能力")
         print(f"当前产能: {self.current_weekly_capacity:,.0f} 立方米/周")
         print(f"最大可达产能: {self.optimal_capacity:,.0f} 立方米/周")
         print(f"可提升产能: {capacity_increase:,.0f} 立方米/周")
@@ -204,7 +252,7 @@ class Problem4CapacityOptimizer:
         return self.optimal_capacity
     
     def generate_optimal_supply_plan(self):
-        """生成最优供货计划，考虑转运能力约束"""
+        """生成最优供货计划，考虑转运能力约束和预测模型"""
         print(f"\n生成基于{self.optimal_capacity:,.0f}立方米/周产能的供货计划...")
         
         # 每周最大转运能力
@@ -225,7 +273,37 @@ class Problem4CapacityOptimizer:
             weekly_demands[material] = adjusted_capacity * consumption
             print(f"  {material}类原材料需求: {weekly_demands[material]:,.0f} 立方米/周")
         
-        # 选择供应商策略：优先选择高可靠性和高产能的供应商
+        # 获取各供应商的预测供货能力
+        supplier_predicted_capacity = {}
+        if self.prediction_model_available:
+            print("  获取供应商预测供货能力...")
+            try:
+                all_supplier_ids = self.supplier_data['supplier_id'].tolist()
+                # 使用直接的批量预测函数
+                prediction_results = predict_multiple_suppliers(
+                    all_supplier_ids, 
+                    prediction_weeks=4,  # 预测未来4周取平均
+                    use_multithread=True
+                )
+                
+                for supplier_id, predictions in prediction_results.items():
+                    # 取预测平均值，但限制在合理范围内
+                    avg_prediction = np.mean(predictions)
+                    supplier_info = self.supplier_data[self.supplier_data['supplier_id'] == supplier_id]
+                    if not supplier_info.empty:
+                        max_capacity = supplier_info['max_weekly_capacity'].iloc[0]
+                        # 限制预测值在历史最大值的120%以内
+                        avg_prediction = min(avg_prediction, max_capacity * 1.2)
+                        avg_prediction = max(avg_prediction, max_capacity * 0.3)  # 至少30%
+                    
+                    supplier_predicted_capacity[supplier_id] = avg_prediction
+                    
+                print(f"    ✓ 获取{len(supplier_predicted_capacity)}家供应商的预测供货能力")
+            except Exception as e:
+                print(f"    ⚠ 预测供货能力失败: {e}")
+                supplier_predicted_capacity = {}
+        
+        # 选择供应商策略：优先选择高可靠性和高预测产能的供应商
         for week in range(1, self.planning_weeks + 1):
             week_supplies = []
             week_total_supply = 0
@@ -233,16 +311,30 @@ class Problem4CapacityOptimizer:
             for material in ['A', 'B', 'C']:
                 material_demand = weekly_demands[material]
                 
-                # 按可靠性和产能排序选择供应商
+                # 按可靠性和预测产能排序选择供应商
                 material_suppliers = self.supplier_data[
                     self.supplier_data['material_type'] == material
                 ].copy()
                 
-                # 优先选择Top50供应商，然后按产能排序
-                material_suppliers = material_suppliers.sort_values(
-                    ['is_top50', 'reliability_score', 'max_weekly_capacity'], 
-                    ascending=[False, False, False]
-                )
+                # 添加预测产能信息
+                if supplier_predicted_capacity:
+                    material_suppliers['predicted_capacity'] = material_suppliers['supplier_id'].map(
+                        lambda x: supplier_predicted_capacity.get(x, material_suppliers[
+                            material_suppliers['supplier_id'] == x]['max_weekly_capacity'].iloc[0] * 0.7 
+                            if not material_suppliers[material_suppliers['supplier_id'] == x].empty else 100
+                        )
+                    )
+                    # 按预测产能和可靠性排序
+                    material_suppliers = material_suppliers.sort_values(
+                        ['is_top50', 'reliability_score', 'predicted_capacity'], 
+                        ascending=[False, False, False]
+                    )
+                else:
+                    # 如果没有预测数据，按原方式排序
+                    material_suppliers = material_suppliers.sort_values(
+                        ['is_top50', 'reliability_score', 'max_weekly_capacity'], 
+                        ascending=[False, False, False]
+                    )
                 
                 allocated_demand = 0
                 supplier_count = 0
@@ -255,9 +347,17 @@ class Problem4CapacityOptimizer:
                     if week_total_supply >= max_weekly_transport * 0.95:
                         break
                     
-                    # 限制单个供应商的供货量，避免超过转运商单次运力
+                    # 确定供应商的供货能力
+                    if supplier_predicted_capacity and supplier['supplier_id'] in supplier_predicted_capacity:
+                        # 使用预测产能，但不超过70%（保持稳定性）
+                        base_capacity = supplier_predicted_capacity[supplier['supplier_id']] * 0.7
+                    else:
+                        # 使用历史最大值的70%
+                        base_capacity = supplier['max_weekly_capacity'] * 0.7
+                    
+                    # 限制单个供应商的供货量
                     supply_capacity = min(
-                        supplier['max_weekly_capacity'] * 0.7,
+                        base_capacity,
                         self.transporter_capacity,  # 不超过单个转运商能力
                         material_demand - allocated_demand,  # 不超过需求量
                         max_weekly_transport * 0.95 - week_total_supply  # 不超过周转运余量
@@ -271,7 +371,8 @@ class Problem4CapacityOptimizer:
                             'supply_quantity': supply_capacity,
                             'conversion_factor': supplier['conversion_factor'],
                             'product_capacity': supply_capacity * supplier['conversion_factor'],
-                            'reliability_score': supplier['reliability_score']
+                            'reliability_score': supplier['reliability_score'],
+                            'is_predicted': supplier['supplier_id'] in supplier_predicted_capacity
                         })
                         
                         allocated_demand += supply_capacity
@@ -279,7 +380,8 @@ class Problem4CapacityOptimizer:
                         supplier_count += 1
                 
                 if week == 1:  # 只在第一周显示详细信息
-                    print(f"    第{week}周{material}类: 使用{supplier_count}家供应商, 分配{allocated_demand:,.0f}立方米")
+                    predicted_count = sum(1 for s in week_supplies[-supplier_count:] if s.get('is_predicted', False))
+                    print(f"    第{week}周{material}类: 使用{supplier_count}家供应商(预测模型指导: {predicted_count}家), 分配{allocated_demand:,.0f}立方米")
             
             if week == 1:
                 print(f"    第{week}周总供货量: {week_total_supply:,.0f} 立方米")
@@ -288,7 +390,15 @@ class Problem4CapacityOptimizer:
         
         self.supply_plan = pd.DataFrame(self.supply_plan)
         total_weekly_avg = len(self.supply_plan) / 24 if len(self.supply_plan) > 0 else 0
+        
+        # 统计预测模型的使用情况
+        predicted_records = self.supply_plan[self.supply_plan.get('is_predicted', False)].shape[0] if 'is_predicted' in self.supply_plan.columns else 0
         print(f"✓ 供货计划生成完成，共{len(self.supply_plan)}条记录，平均每周{total_weekly_avg:.1f}条")
+        print(f"✓ 其中{predicted_records}条记录基于预测模型指导")
+        
+        # 清理不必要的列
+        if 'is_predicted' in self.supply_plan.columns:
+            self.supply_plan = self.supply_plan.drop('is_predicted', axis=1)
         
     def allocate_transporters(self):
         """分配转运商"""
